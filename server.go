@@ -21,7 +21,7 @@ func NewServer(network, address string) (*Server, error) {
 	}
 	server := &Server{
 		listener: l,
-		ch:       make(chan serverAccept, 10),
+		ch:       make(chan serverAccept, 100),
 	}
 	go server.runtime()
 	return server, nil
