@@ -1,7 +1,15 @@
 package neat
 
 import (
+	"errors"
 	"net"
+	"sync/atomic"
+	"time"
+)
+
+var (
+	ErrTimeout     = errors.New("timeout")
+	ErrServerClose = errors.New("server_closed")
 )
 
 type Server struct {
@@ -10,57 +18,172 @@ type Server struct {
 }
 
 type serverAccept struct {
-	conn net.Conn
-	err  error
+	err    error
+	client *Client
 }
 
-func NewServer(network, address string) (*Server, error) {
-	l, err := net.Listen(network, address)
-	if err != nil {
-		return nil, err
+func NewServer(listener net.Listener) *Server {
+	s := &Server{
+		listener: listener,
+		ch:       make(chan serverAccept, 10),
 	}
-	server := &Server{
-		listener: l,
-		ch:       make(chan serverAccept, 100),
-	}
-	go server.runtime()
-	return server, nil
+	go s.runtime()
+	return s
 }
 
-func (s *Server) Close() error {
-	return s.listener.Close()
+func (s *Server) Accept(blocking bool) (*Client, error) {
+	if blocking {
+		v := <-s.ch
+		return v.client, v.err
+	}
+	select {
+	case v := <-s.ch:
+		return v.client, v.err
+	default:
+		return nil, nil
+	}
+}
+
+func (s *Server) Close() {
+	s.listener.Close()
+}
+
+func (s *Server) Addr() net.Addr {
+	return s.listener.Addr()
 }
 
 func (s *Server) runtime() {
 	for {
-		c, err := s.listener.Accept()
+		conn, err := s.listener.Accept()
 		if err != nil {
 			s.ch <- serverAccept{err: err}
 			return
 		}
-		s.ch <- serverAccept{conn: c}
+		c := &Client{
+			conn:   conn,
+			ch:     make(chan clientMessage, 10),
+			server: true,
+		}
+		go c.runtime()
+		s.ch <- serverAccept{client: c}
 	}
 }
 
-func (s *Server) Accept(block bool) (*Client, error) {
-	var v serverAccept
-	if block {
-		v = <-s.ch
-	} else {
-		select {
-		case v = <-s.ch:
-		default:
-			return nil, nil
+type Client struct {
+	conn     net.Conn
+	ch       chan clientMessage
+	server   bool
+	pingSent time.Time
+	ping     int64
+}
+
+func NewClient(conn net.Conn) *Client {
+	c := &Client{
+		conn: conn,
+		ch:   make(chan clientMessage, 10),
+	}
+	go c.runtime()
+	return c
+}
+
+type clientMessage struct {
+	err  error
+	data []byte
+}
+
+func (c *Client) runtime() {
+	reader := make([]byte, 8192)
+	buffer := []byte{}
+	if !c.server {
+		go func() {
+			for {
+				c.pingSent = time.Now()
+				if n, err := c.conn.Write([]byte{0, 0}); n != 2 || err != nil {
+					return
+				}
+				time.Sleep(time.Second * 3)
+			}
+		}()
+	}
+	for {
+		c.conn.SetReadDeadline(time.Now().Add(time.Second * 5))
+		l, err := c.conn.Read(reader)
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				c.onError(ErrTimeout)
+				return
+			}
+			c.onError(err)
+			return
+		}
+		buffer = append(buffer, reader[:l]...)
+	parse:
+		for {
+			if len(buffer) < 2 {
+				break parse
+			}
+			messageSize := 2 + int(uint16(buffer[0])|uint16(buffer[1])<<8)
+			if len(buffer) < messageSize {
+				break parse
+			}
+			c.onMessage(buffer[2:messageSize])
+			if len(buffer) == messageSize {
+				buffer = []byte{}
+				break parse
+			}
+			buffer = buffer[messageSize:]
 		}
 	}
-	if v.err != nil {
-		return nil, v.err
+}
+
+func (c *Client) onMessage(v []byte) {
+	if len(v) == 0 { // pong
+		if c.server {
+			c.conn.Write([]byte{0, 0})
+			return
+		}
+		ping := int64(time.Since(c.pingSent))
+		atomic.StoreInt64(&c.ping, ping)
+		return
 	}
-	cli := &Client{
-		conn:   v.conn,
-		buffer: make([]byte, 0),
-		ch:     make(chan *clientPayload, 30),
+	c.ch <- clientMessage{data: v}
+}
+
+func (c *Client) onError(err error) {
+	c.ch <- clientMessage{err: err}
+}
+
+func (c *Client) Read(blocking bool) ([]byte, error) {
+	if blocking {
+		v := <-c.ch
+		return v.data, v.err
 	}
-	go cli.runtime()
-	return cli, nil
+	select {
+	case v := <-c.ch:
+		return v.data, v.err
+	default:
+		return nil, nil
+	}
+}
+
+func (c *Client) Write(v []byte) {
+	l := uint16(len(v))
+	c.conn.Write([]byte{byte(l), byte(l >> 8)})
+	c.conn.Write(v)
+}
+
+func (c *Client) Ping() time.Duration {
+	return time.Duration(atomic.LoadInt64(&c.ping))
+}
+
+func (c *Client) Close() {
+	c.conn.Close()
+}
+
+func (c *Client) RemoteAddr() net.Addr {
+	return c.conn.RemoteAddr()
+}
+
+func (c *Client) LocalAddr() net.Addr {
+	return c.conn.LocalAddr()
 }
