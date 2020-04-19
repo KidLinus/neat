@@ -3,13 +3,11 @@ package neat
 import (
 	"errors"
 	"net"
-	"sync/atomic"
 	"time"
 )
 
 var (
-	ErrTimeout     = errors.New("timeout")
-	ErrServerClose = errors.New("server_closed")
+	ErrTimeout = errors.New("timeout")
 )
 
 type Server struct {
@@ -60,9 +58,8 @@ func (s *Server) runtime() {
 			return
 		}
 		c := &Client{
-			conn:   conn,
-			ch:     make(chan clientMessage, 10),
-			server: true,
+			conn: conn,
+			ch:   make(chan clientMessage, 10),
 		}
 		go c.runtime()
 		s.ch <- serverAccept{client: c}
@@ -70,11 +67,8 @@ func (s *Server) runtime() {
 }
 
 type Client struct {
-	conn     net.Conn
-	ch       chan clientMessage
-	server   bool
-	pingSent time.Time
-	ping     int64
+	conn net.Conn
+	ch   chan clientMessage
 }
 
 func NewClient(conn net.Conn) *Client {
@@ -88,25 +82,14 @@ func NewClient(conn net.Conn) *Client {
 
 type clientMessage struct {
 	err  error
-	data []byte
+	data *BufferReadable
 }
 
 func (c *Client) runtime() {
 	reader := make([]byte, 8192)
 	buffer := []byte{}
-	if !c.server {
-		go func() {
-			for {
-				c.pingSent = time.Now()
-				if n, err := c.conn.Write([]byte{0, 0}); n != 2 || err != nil {
-					return
-				}
-				time.Sleep(time.Second * 3)
-			}
-		}()
-	}
 	for {
-		c.conn.SetReadDeadline(time.Now().Add(time.Second * 5))
+		c.conn.SetReadDeadline(time.Now().Add(time.Second * 10))
 		l, err := c.conn.Read(reader)
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
@@ -137,23 +120,18 @@ func (c *Client) runtime() {
 }
 
 func (c *Client) onMessage(v []byte) {
-	if len(v) == 0 { // pong
-		if c.server {
-			c.conn.Write([]byte{0, 0})
-			return
-		}
-		ping := int64(time.Since(c.pingSent))
-		atomic.StoreInt64(&c.ping, ping)
+	if len(v) == 0 {
+		c.conn.Write([]byte{0, 0})
 		return
 	}
-	c.ch <- clientMessage{data: v}
+	c.ch <- clientMessage{data: &BufferReadable{Buffer: v}}
 }
 
 func (c *Client) onError(err error) {
 	c.ch <- clientMessage{err: err}
 }
 
-func (c *Client) Read(blocking bool) ([]byte, error) {
+func (c *Client) Read(blocking bool) (*BufferReadable, error) {
 	if blocking {
 		v := <-c.ch
 		return v.data, v.err
@@ -170,10 +148,6 @@ func (c *Client) Write(v []byte) {
 	l := uint16(len(v))
 	c.conn.Write([]byte{byte(l), byte(l >> 8)})
 	c.conn.Write(v)
-}
-
-func (c *Client) Ping() time.Duration {
-	return time.Duration(atomic.LoadInt64(&c.ping))
 }
 
 func (c *Client) Close() {
