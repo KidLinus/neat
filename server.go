@@ -57,6 +57,9 @@ func (s *Server) runtime() {
 			s.ch <- serverAccept{err: err}
 			return
 		}
+		if tc, ok := conn.(*net.TCPConn); ok {
+			tc.SetLinger(1)
+		}
 		c := &Client{
 			conn: conn,
 			ch:   make(chan clientMessage, 10),
